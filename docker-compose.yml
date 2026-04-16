@@ -1,12 +1,44 @@
 version: '3.8'
 
 services:
+  # 新增的 WARP 代理服务
+  warp:
+    image: caomingjun/warp:latest  # 目前维护较好、极简的 WARP SOCKS5 镜像
+    container_name: kiro-warp
+    restart: always
+    cap_add:
+      - NET_ADMIN  # 必须开启网络管理权限，WARP 需要创建虚拟网卡
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=0
+      - net.ipv4.conf.all.src_valid_mark=1
+    # 如果你想在宿主机也使用这个代理，可以暴露端口，否则不需要暴露
+    # ports:
+    #   - "1080:1080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f -x socks5h://localhost:1080 https://cloudflare.com/cdn-cgi/trace || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s 
+
   kiro-go:
     build: .
+    container_name: kiro-go
+    depends_on:
+      warp:
+        condition: service_healthy  # 等待 WARP 健康检查通过后再启动
     ports:
       - "8080:8080"
     volumes:
       - ./data:/app/data
     environment:
       - CONFIG_PATH=/app/data/config.json
+      - ADMIN_PASSWORD=admin123  # 修改为你想要的密码
+      # --- 下面是给 Kiro-Go 注入的代理配置 ---
+      # 让 Go 程序的底层网络库自动将出站请求转发到 warp 容器的 1080 端口
+      - HTTP_PROXY=socks5://warp:1080
+      - HTTPS_PROXY=socks5://warp:1080
+      - ALL_PROXY=socks5://warp:1080
+      # 排除内网和本地回环地址，防止控制面板等本地服务也走代理导致无法访问
+      - NO_PROXY=localhost,127.0.0.1,0.0.0.0,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12
     restart: unless-stopped

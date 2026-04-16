@@ -158,8 +158,13 @@ func getSortedEndpoints(preferred string) []kiroEndpoint {
 	return []kiroEndpoint{kiroEndpoints[0], kiroEndpoints[1]}
 }
 
-// CallKiroAPI 调用 Kiro API（流式），双端点自动 fallback
+// CallKiroAPI 调用 Kiro API（流式），429 后等待 3 秒重试一次，再失败则禁用 6 小时
 func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
+	return CallKiroAPIWithContext(nil, account, payload, callback)
+}
+
+// CallKiroAPIWithContext 调用 Kiro API，支持上下文取消
+func CallKiroAPIWithContext(ctx interface{}, account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
 	if _, err := json.Marshal(payload); err != nil {
 		return err
 	}
@@ -179,7 +184,34 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	endpoints := getSortedEndpoints(config.GetPreferredEndpoint())
 
 	var lastErr error
-	for _, ep := range endpoints {
+	var got429 bool // 标记是否已经遇到过 429
+	
+	for i, ep := range endpoints {
+		// 检查上下文是否已取消
+		if ctx != nil {
+			select {
+			case <-ctx.(interface{ Done() <-chan struct{} }).Done():
+				return fmt.Errorf("request cancelled by client")
+			default:
+			}
+		}
+
+		// 如果之前遇到过 429，等待 3 秒后重试
+		if got429 && i > 0 {
+			fmt.Printf("[KiroAPI] Got 429, waiting 3s before retry with %s...\n", ep.Name)
+			select {
+			case <-time.After(3 * time.Second):
+				// 等待完成
+			case <-func() <-chan struct{} {
+				if ctx != nil {
+					return ctx.(interface{ Done() <-chan struct{} }).Done()
+				}
+				return make(chan struct{}) // 永不关闭的 channel
+			}():
+				return fmt.Errorf("request cancelled during retry wait")
+			}
+		}
+
 		// 更新 payload 中的 origin
 		payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
 
@@ -188,6 +220,16 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		if err != nil {
 			lastErr = err
 			continue
+		}
+
+		// 如果有上下文，设置到请求中
+		if ctx != nil {
+			req = req.WithContext(ctx.(interface {
+				Done() <-chan struct{}
+				Err() error
+				Deadline() (deadline time.Time, ok bool)
+				Value(key interface{}) interface{}
+			}))
 		}
 
 		req.Header.Set("Content-Type", "application/json")
@@ -210,23 +252,43 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 
 		if resp.StatusCode == 429 {
 			resp.Body.Close()
-			fmt.Printf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...\n", ep.Name)
-			lastErr = fmt.Errorf("quota exhausted on %s", ep.Name)
-			continue
+			
+			if got429 {
+				// 第二次 429，返回错误（外层会禁用账号 6 小时）
+				fmt.Printf("[KiroAPI] Endpoint %s quota exhausted (429) again, will disable account\n", ep.Name)
+				lastErr = fmt.Errorf("rate_limit:quota exhausted on %s after retry", ep.Name)
+				return lastErr // 直接返回，触发禁用
+			} else {
+				// 第一次 429，标记并继续尝试下一个端点
+				fmt.Printf("[KiroAPI] Endpoint %s quota exhausted (429), will retry after 3s\n", ep.Name)
+				got429 = true
+				lastErr = fmt.Errorf("rate_limit:quota exhausted on %s", ep.Name)
+				continue
+			}
 		}
 
 		if resp.StatusCode != 200 {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			lastErr = fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
+			
+			// 检查是否为账号封禁（403 或包含 SUSPENDED 关键词）
+			errBodyStr := string(errBody)
+			if resp.StatusCode == 403 || strings.Contains(errBodyStr, "SUSPENDED") || strings.Contains(errBodyStr, "suspended") {
+				lastErr = fmt.Errorf("account_banned:HTTP %d from %s: %s", resp.StatusCode, ep.Name, errBodyStr)
+				fmt.Printf("[KiroAPI] ⛔ Account banned or suspended on %s: %v\n", ep.Name, lastErr)
+				return lastErr // 直接返回，触发账号封禁标记
+			}
+			
+			lastErr = fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, errBodyStr)
 			// 认证错误不继续尝试
-			if resp.StatusCode == 401 || resp.StatusCode == 403 {
+			if resp.StatusCode == 401 {
 				return lastErr
 			}
 			fmt.Printf("[KiroAPI] Endpoint %s error: %v\n", ep.Name, lastErr)
 			continue
 		}
 
+		// 成功
 		err = parseEventStream(resp.Body, callback)
 		resp.Body.Close()
 		return err
@@ -296,6 +358,20 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		switch eventType {
 		case "assistantResponseEvent":
 			if content, ok := event["content"].(string); ok && content != "" {
+				// 检测限流相关的文本提示
+				contentLower := strings.ToLower(content)
+				if strings.Contains(contentLower, "too many requests") ||
+					strings.Contains(contentLower, "rate limit") ||
+					strings.Contains(contentLower, "quota exceeded") ||
+					strings.Contains(contentLower, "request limit") ||
+					strings.Contains(contentLower, "throttl") {
+					// 触发限流错误回调
+					if callback.OnError != nil {
+						callback.OnError(fmt.Errorf("rate limit detected in response: %s", content))
+					}
+					return fmt.Errorf("rate limit detected in response")
+				}
+				
 				normalized := normalizeChunk(content, &lastAssistantContent)
 				if normalized != "" {
 					callback.OnText(normalized, false)
