@@ -1,6 +1,7 @@
 ﻿package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/sync/semaphore"
 )
 
 // Handler HTTP 处理�?
@@ -33,6 +35,8 @@ type Handler struct {
 	cachedModels    []ModelInfo
 	modelsCacheMu   sync.RWMutex
 	modelsCacheTime int64
+	// 并发控制信号量（限制同时向 AWS 发起的请求数）
+	awsSemaphore *semaphore.Weighted
 }
 
 type thinkingStreamSource int
@@ -63,6 +67,13 @@ func allowTagSource(source *thinkingStreamSource) bool {
 
 func NewHandler() *Handler {
 	totalReq, successReq, failedReq, totalTokens, totalCredits := config.GetStats()
+	
+	// 从配置读取并发限制，默认为 1（完全串行化）
+	concurrencyLimit := int64(config.GetConcurrencyLimit())
+	if concurrencyLimit <= 0 {
+		concurrencyLimit = 1
+	}
+	
 	h := &Handler{
 		pool:            pool.GetPool(),
 		totalRequests:   int64(totalReq),
@@ -73,10 +84,14 @@ func NewHandler() *Handler {
 		startTime:       time.Now().Unix(),
 		stopRefresh:     make(chan struct{}),
 		stopStatsSaver:  make(chan struct{}),
+		awsSemaphore:    semaphore.NewWeighted(concurrencyLimit),
 	}
+	
+	fmt.Printf("[Handler] AWS concurrency limit: %d (requests will queue if limit exceeded)\n", concurrencyLimit)
+	
 	// 启动后台刷新
 	go h.backgroundRefresh()
-	// 启动后台统计保存 (�?0秒保存一�?
+	// 启动后台统计保存 (每 30 秒保存一次)
 	go h.backgroundStatsSaver()
 	return h
 }
@@ -490,14 +505,14 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// 流式或非流式
 	if req.Stream {
-		h.handleClaudeStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens)
+		h.handleClaudeStream(w, r, account, kiroPayload, req.Model, thinking, estimatedInputTokens)
 	} else {
-		h.handleClaudeNonStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens)
+		h.handleClaudeNonStream(w, r, account, kiroPayload, req.Model, thinking, estimatedInputTokens)
 	}
 }
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int) {
+func (h *Handler) handleClaudeStream(w http.ResponseWriter, r *http.Request, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -840,7 +855,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 		},
 	}
 
-	err := CallKiroAPI(account, payload, callback)
+	err := h.callKiroAPIWithQueue(r, account, payload, callback)
 	if err != nil {
 		h.recordFailure()
 		h.handleAPIError(account.ID, err)
@@ -956,8 +971,8 @@ func (h *Handler) recordFailure() {
 	atomic.AddInt64(&h.failedRequests, 1)
 }
 
-// handleClaudeNonStream Claude 非流式响�?
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int) {
+// handleClaudeNonStream Claude 非流式响应
+func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, r *http.Request, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int) {
 	var content string
 	var thinkingContent string
 	var toolUses []KiroToolUse
@@ -987,7 +1002,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.A
 		},
 	}
 
-	err := CallKiroAPI(account, payload, callback)
+	err := h.callKiroAPIWithQueue(r, account, payload, callback)
 	if err != nil {
 		h.recordFailure()
 		h.handleAPIError(account.ID, err)
@@ -1083,14 +1098,14 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Stream {
-		h.handleOpenAIStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens)
+		h.handleOpenAIStream(w, r, account, kiroPayload, req.Model, thinking, estimatedInputTokens)
 	} else {
-		h.handleOpenAINonStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens)
+		h.handleOpenAINonStream(w, r, account, kiroPayload, req.Model, thinking, estimatedInputTokens)
 	}
 }
 
 // handleOpenAIStream OpenAI 流式响应
-func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int) {
+func (h *Handler) handleOpenAIStream(w http.ResponseWriter, r *http.Request, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1403,7 +1418,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 		},
 	}
 
-	err := CallKiroAPI(account, payload, callback)
+	err := h.callKiroAPIWithQueue(r, account, payload, callback)
 	if err != nil {
 		h.recordFailure()
 		h.handleAPIError(account.ID, err)
@@ -1464,8 +1479,8 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 	flusher.Flush()
 }
 
-// handleOpenAINonStream OpenAI 非流式响�?
-func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int) {
+// handleOpenAINonStream OpenAI 非流式响应
+func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, r *http.Request, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int) {
 	var content string
 	var reasoningContent string
 	var toolUses []KiroToolUse
@@ -1486,7 +1501,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.A
 		OnCredits:  func(c float64) { credits = c },
 	}
 
-	err := CallKiroAPI(account, payload, callback)
+	err := h.callKiroAPIWithQueue(r, account, payload, callback)
 	if err != nil {
 		h.recordFailure()
 		h.handleAPIError(account.ID, err)
@@ -1545,10 +1560,52 @@ func (h *Handler) ensureValidToken(account *config.Account) error {
 	}
 	account.ExpiresAt = expiresAt
 
-	// 持久�?
+	// 持久化
 	config.UpdateAccountToken(account.ID, accessToken, refreshToken, expiresAt)
 
 	return nil
+}
+
+// callKiroAPIWithQueue 包装 CallKiroAPI，实现请求排队和并发控制
+// 这个方法会：
+// 1. 使用信号量限制并发（默认并发度为 1，完全串行化）
+// 2. 支持排队等待（阻塞而不是立即返回 429）
+// 3. 支持超时控制（默认 60 秒）
+// 4. 支持客户端断开检测
+func (h *Handler) callKiroAPIWithQueue(r *http.Request, account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
+	// 创建带超时的 context（默认 60 秒排队超时）
+	queueTimeout := time.Duration(config.GetQueueTimeout()) * time.Second
+	if queueTimeout <= 0 {
+		queueTimeout = 60 * time.Second
+	}
+	
+	ctx, cancel := context.WithTimeout(r.Context(), queueTimeout)
+	defer cancel()
+	
+	// 尝试获取信号量（排队等待）
+	if err := h.awsSemaphore.Acquire(ctx, 1); err != nil {
+		if err == context.DeadlineExceeded {
+			return fmt.Errorf("rate_limit:request queue timeout after %v", queueTimeout)
+		}
+		if err == context.Canceled {
+			return fmt.Errorf("request cancelled by client")
+		}
+		return fmt.Errorf("failed to acquire semaphore: %w", err)
+	}
+	defer h.awsSemaphore.Release(1)
+	
+	// 检查客户端是否已断开
+	select {
+	case <-ctx.Done():
+		if ctx.Err() == context.Canceled {
+			return fmt.Errorf("request cancelled by client")
+		}
+		return fmt.Errorf("request timeout: %w", ctx.Err())
+	default:
+	}
+	
+	// 调用实际的 AWS API（传入 context 以支持取消）
+	return CallKiroAPIWithContext(ctx, account, payload, callback)
 }
 
 // ==================== 管理 API ====================

@@ -4,8 +4,6 @@
   "host": "0.0.0.0",
   "apiKey": "sk-C6RYhcJ142VrQCJnMmDr1VFudluUIuPh",
   "requireApiKey": true,
-  "preferredEndpoint": "codewhisperer",
-  "rateLimitBanHours": 1,
   "accounts": [
     {
       "id": "eb4d5a7b-3acd-4919-b550-8a0d121f0848",
@@ -36,6 +34,8 @@
       "trialExpiresAt": 1778898163
     }
   ],
+  "preferredEndpoint": "codewhisperer",
+  "rateLimitBanHours": 1,
   "totalRequests": 37,
   "failedRequests": 37
 }

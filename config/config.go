@@ -107,6 +107,10 @@ type Config struct {
 	// Rate limit ban duration in hours (default: 1)
 	RateLimitBanHours int `json:"rateLimitBanHours,omitempty"`
 
+	// Concurrency control settings
+	ConcurrencyLimit int `json:"concurrencyLimit,omitempty"` // Max concurrent AWS requests (default: 1)
+	QueueTimeout     int `json:"queueTimeout,omitempty"`     // Queue wait timeout in seconds (default: 60)
+
 	// Global statistics (persisted across restarts)
 	TotalRequests   int     `json:"totalRequests,omitempty"`   // Total API requests received
 	SuccessRequests int     `json:"successRequests,omitempty"` // Successful requests count
@@ -462,5 +466,47 @@ func UpdateRateLimitBanHours(hours int) error {
 		hours = 1
 	}
 	cfg.RateLimitBanHours = hours
+	return Save()
+}
+
+// GetConcurrencyLimit 获取并发限制（默认 1）
+func GetConcurrencyLimit() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg.ConcurrencyLimit <= 0 {
+		return 1 // 默认并发度为 1（完全串行化）
+	}
+	return cfg.ConcurrencyLimit
+}
+
+// UpdateConcurrencyLimit 更新并发限制
+func UpdateConcurrencyLimit(limit int) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if limit <= 0 {
+		limit = 1
+	}
+	cfg.ConcurrencyLimit = limit
+	return Save()
+}
+
+// GetQueueTimeout 获取队列超时时间（秒，默认 60）
+func GetQueueTimeout() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg.QueueTimeout <= 0 {
+		return 60 // 默认 60 秒
+	}
+	return cfg.QueueTimeout
+}
+
+// UpdateQueueTimeout 更新队列超时时间
+func UpdateQueueTimeout(timeout int) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if timeout <= 0 {
+		timeout = 60
+	}
+	cfg.QueueTimeout = timeout
 	return Save()
 }

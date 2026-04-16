@@ -560,9 +560,10 @@ func (p *AccountPool) getNextUnlocked() *config.Account {
 	return best
 }
 
-// cleanupStaleSessions 定期清理过期的会话绑定（30 分钟未使用）
+// cleanupStaleSessions 定期清理过期的会话绑定（10 分钟未使用）
+// 当会话超时被清理时，将关联的 AWS 账号状态重置为 Free（清理 AWS ConversationID）
 func (p *AccountPool) cleanupStaleSessions() {
-	ticker := time.NewTicker(10 * time.Minute)
+	ticker := time.NewTicker(2 * time.Minute) // 每 2 分钟检查一次
 	defer ticker.Stop()
 
 	for range ticker.C {
@@ -573,15 +574,32 @@ func (p *AccountPool) cleanupStaleSessions() {
 		}
 
 		now := time.Now()
-		staleThreshold := 30 * time.Minute
+		idleTimeout := 10 * time.Minute // 10 分钟闲置超时
 
+		var cleanedCount int
 		for conversationID, lastUsed := range p.sessionLastUsed {
-			if now.Sub(lastUsed) > staleThreshold {
-				delete(p.sessionAffinity, conversationID)
+			if now.Sub(lastUsed) > idleTimeout {
+				// 获取绑定的账号 ID
+				if accountID, exists := p.sessionAffinity[conversationID]; exists {
+					// 清理该账号的 AWS ConversationID（重置为 Free 状态）
+					if awsConvID, hasAwsConv := p.sessionAwsConvID[accountID]; hasAwsConv {
+						fmt.Printf("[SessionAffinity] 🧹 Cleaning up stale session: conversation=%s, account=%s, awsConvID=%s\n", 
+							conversationID, accountID, awsConvID)
+						delete(p.sessionAwsConvID, accountID)
+					}
+					
+					delete(p.sessionAffinity, conversationID)
+				}
+				
 				delete(p.sessionLastUsed, conversationID)
-				fmt.Printf("[SessionAffinity] Cleaned up stale conversation %s\n", conversationID)
+				cleanedCount++
 			}
 		}
+		
+		if cleanedCount > 0 {
+			fmt.Printf("[SessionAffinity] Cleaned up %d stale sessions (idle > 10 minutes)\n", cleanedCount)
+		}
+		
 		p.mu.Unlock()
 	}
 }
