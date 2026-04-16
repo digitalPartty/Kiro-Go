@@ -22,6 +22,7 @@ timers       map[string]*time.Timer // 自动恢复定时器
 // 会话粘滞：conversationId -> accountID 映射
 sessionAffinity map[string]string    // 对话 ID → 账号 ID
 sessionLastUsed map[string]time.Time // 对话 ID → 最后使用时间
+sessionAwsConvID map[string]string   // 账号 ID → AWS ConversationID（用于清理）
 }
 
 var (
@@ -33,11 +34,12 @@ var (
 func GetPool() *AccountPool {
 	poolOnce.Do(func() {
 		pool = &AccountPool{
-			cooldowns:       make(map[string]time.Time),
-			errorCounts:     make(map[string]int),
-			timers:          make(map[string]*time.Timer),
-			sessionAffinity: make(map[string]string),
-			sessionLastUsed: make(map[string]time.Time),
+			cooldowns:        make(map[string]time.Time),
+			errorCounts:      make(map[string]int),
+			timers:           make(map[string]*time.Timer),
+			sessionAffinity:  make(map[string]string),
+			sessionLastUsed:  make(map[string]time.Time),
+			sessionAwsConvID: make(map[string]string),
 		}
 		pool.Reload()
 		pool.restorePendingRecoveries()

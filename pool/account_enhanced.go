@@ -4,10 +4,8 @@ package pool
 
 import (
 	"fmt"
-	"kiro-api-proxy/auth"
 	"kiro-api-proxy/config"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -99,7 +97,7 @@ func (p *AccountPoolEnhanced) unbindAllSessionsForAccount(accountID string) {
 func (p *AccountPoolEnhanced) GetForConversation(conversationID string) *config.Account {
 	if conversationID == "" {
 		// 无对话 ID，使用普通轮询
-		return p.GetNext()
+		return GetPool().GetNext()
 	}
 
 	p.mu.Lock()
@@ -171,7 +169,11 @@ func (p *AccountPoolEnhanced) GetForConversation(conversationID string) *config.
 	}
 
 	// 没有绑定或绑定失效，分配新账号
-	acc := p.getNextUnlocked()
+	// 注意：这里需要调用 GetPool().GetNext() 因为 AccountPoolEnhanced 没有实现 getNextUnlocked
+	p.mu.Unlock()
+	acc := GetPool().GetNext()
+	p.mu.Lock()
+	
 	if acc != nil {
 		p.sessionAffinity[conversationID] = acc.ID
 		p.sessionLastUsed[conversationID] = time.Now()
@@ -340,7 +342,7 @@ func (p *AccountPoolEnhanced) autoEnableAccount(id string) {
 				p.mu.Unlock()
 				
 				// 重新加载账号池
-				p.Reload()
+				GetPool().Reload()
 			} else {
 				fmt.Printf("[AccountPool] Failed to auto-enable account %s: %v\n", acc.Email, err)
 			}

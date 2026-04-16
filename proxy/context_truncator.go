@@ -4,7 +4,6 @@ package proxy
 
 import (
 	"fmt"
-	"strings"
 )
 
 const (
