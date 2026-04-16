@@ -33,12 +33,16 @@ var (
 func GetPool() *AccountPool {
 	poolOnce.Do(func() {
 		pool = &AccountPool{
-			cooldowns:   make(map[string]time.Time),
-			errorCounts: make(map[string]int),
-			timers:      make(map[string]*time.Timer),
+			cooldowns:       make(map[string]time.Time),
+			errorCounts:     make(map[string]int),
+			timers:          make(map[string]*time.Timer),
+			sessionAffinity: make(map[string]string),
+			sessionLastUsed: make(map[string]time.Time),
 		}
 		pool.Reload()
 		pool.restorePendingRecoveries()
+		// 启动会话清理任务
+		go pool.cleanupStaleSessions()
 	})
 	return pool
 }

@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"strings"
 	"time"
@@ -81,15 +82,16 @@ func MapModel(model string) string {
 // ==================== Claude API 类型 ====================
 
 type ClaudeRequest struct {
-	Model       string          `json:"model"`
-	Messages    []ClaudeMessage `json:"messages"`
-	MaxTokens   int             `json:"max_tokens"`
-	Temperature float64         `json:"temperature,omitempty"`
-	TopP        float64         `json:"top_p,omitempty"`
-	Stream      bool            `json:"stream,omitempty"`
-	System      interface{}     `json:"system,omitempty"` // string or []SystemBlock
-	Tools       []ClaudeTool    `json:"tools,omitempty"`
-	ToolChoice  interface{}     `json:"tool_choice,omitempty"`
+	Model       string                 `json:"model"`
+	Messages    []ClaudeMessage        `json:"messages"`
+	MaxTokens   int                    `json:"max_tokens"`
+	Temperature float64                `json:"temperature,omitempty"`
+	TopP        float64                `json:"top_p,omitempty"`
+	Stream      bool                   `json:"stream,omitempty"`
+	System      interface{}            `json:"system,omitempty"` // string or []SystemBlock
+	Tools       []ClaudeTool           `json:"tools,omitempty"`
+	ToolChoice  interface{}            `json:"tool_choice,omitempty"`
+	Metadata    map[string]interface{} `json:"metadata,omitempty"` // 用于提取会话标识
 }
 
 type ClaudeMessage struct {
@@ -231,7 +233,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	// 构建 payload
 	payload := &KiroPayload{}
 	payload.ConversationState.ChatTriggerType = "MANUAL"
-	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstClaudeConversationAnchor(req.Messages))
+	payload.ConversationState.ConversationID = buildConversationIDWithMetadata(req.Metadata, modelID, systemPrompt, firstClaudeConversationAnchor(req.Messages))
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: finalContent,
 		ModelID: modelID,
@@ -505,13 +507,14 @@ func KiroToClaudeResponse(content, thinkingContent string, toolUses []KiroToolUs
 // ==================== OpenAI API 类型 ====================
 
 type OpenAIRequest struct {
-	Model       string          `json:"model"`
-	Messages    []OpenAIMessage `json:"messages"`
-	MaxTokens   int             `json:"max_tokens,omitempty"`
-	Temperature float64         `json:"temperature,omitempty"`
-	TopP        float64         `json:"top_p,omitempty"`
-	Stream      bool            `json:"stream,omitempty"`
-	Tools       []OpenAITool    `json:"tools,omitempty"`
+	Model       string                 `json:"model"`
+	Messages    []OpenAIMessage        `json:"messages"`
+	MaxTokens   int                    `json:"max_tokens,omitempty"`
+	Temperature float64                `json:"temperature,omitempty"`
+	TopP        float64                `json:"top_p,omitempty"`
+	Stream      bool                   `json:"stream,omitempty"`
+	Tools       []OpenAITool           `json:"tools,omitempty"`
+	User        string                 `json:"user,omitempty"` // OpenAI 的用户标识字段
 }
 
 type OpenAIMessage struct {
@@ -693,7 +696,12 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	// 构建 payload
 	payload := &KiroPayload{}
 	payload.ConversationState.ChatTriggerType = "MANUAL"
-	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstOpenAIConversationAnchor(nonSystemMessages))
+	// OpenAI 使用 user 字段作为会话标识
+	metadata := make(map[string]interface{})
+	if req.User != "" {
+		metadata["user_id"] = req.User
+	}
+	payload.ConversationState.ConversationID = buildConversationIDWithMetadata(metadata, modelID, systemPrompt, firstOpenAIConversationAnchor(nonSystemMessages))
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: finalContent,
 		ModelID: modelID,
@@ -886,10 +894,40 @@ func firstOpenAIConversationAnchor(messages []OpenAIMessage) string {
 func buildConversationID(modelID, systemPrompt, anchor string) string {
 	anchor = strings.TrimSpace(anchor)
 	if anchor == "" {
+		// 如果没有 anchor，生成随机 UUID（这会导致每次都是新会话）
 		return uuid.New().String()
 	}
+	// 基于模型、系统提示和第一条消息生成稳定的会话 ID
 	seed := strings.Join([]string{modelID, strings.TrimSpace(systemPrompt), anchor}, "\n")
 	return uuid.NewSHA1(uuid.NameSpaceURL, []byte(seed)).String()
+}
+
+// buildConversationIDWithMetadata 从 metadata 或消息内容生成会话 ID
+func buildConversationIDWithMetadata(metadata map[string]interface{}, modelID, systemPrompt, anchor string) string {
+	// 优先使用 metadata 中的 user_id 作为会话标识
+	if metadata != nil {
+		if userID, ok := metadata["user_id"].(string); ok && userID != "" {
+			convID := uuid.NewSHA1(uuid.NameSpaceURL, []byte("user:"+userID)).String()
+			fmt.Printf("[ConversationID] Using metadata user_id: %s -> %s\n", userID, convID)
+			return convID
+		}
+	}
+	// 回退到基于消息内容的生成方式
+	convID := buildConversationID(modelID, systemPrompt, anchor)
+	if anchor != "" {
+		fmt.Printf("[ConversationID] Using message anchor (first 50 chars): %s... -> %s\n", 
+			truncateString(anchor, 50), convID)
+	} else {
+		fmt.Printf("[ConversationID] No anchor, generating random ID: %s\n", convID)
+	}
+	return convID
+}
+
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen]
 }
 
 func extractOpenAITextPart(part map[string]interface{}) (string, bool) {
