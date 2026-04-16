@@ -104,6 +104,9 @@ type Config struct {
 	// Endpoint configuration: "auto", "codewhisperer", or "amazonq"
 	PreferredEndpoint string `json:"preferredEndpoint,omitempty"`
 
+	// Rate limit ban duration in hours (default: 1)
+	RateLimitBanHours int `json:"rateLimitBanHours,omitempty"`
+
 	// Global statistics (persisted across restarts)
 	TotalRequests   int     `json:"totalRequests,omitempty"`   // Total API requests received
 	SuccessRequests int     `json:"successRequests,omitempty"` // Successful requests count
@@ -438,5 +441,26 @@ func UpdatePreferredEndpoint(endpoint string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.PreferredEndpoint = endpoint
+	return Save()
+}
+
+// GetRateLimitBanHours 获取 429 封禁时长（小时）
+func GetRateLimitBanHours() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg.RateLimitBanHours <= 0 {
+		return 1 // 默认 1 小时
+	}
+	return cfg.RateLimitBanHours
+}
+
+// UpdateRateLimitBanHours 更新 429 封禁时长
+func UpdateRateLimitBanHours(hours int) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if hours <= 0 {
+		hours = 1
+	}
+	cfg.RateLimitBanHours = hours
 	return Save()
 }

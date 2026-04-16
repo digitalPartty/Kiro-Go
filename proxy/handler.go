@@ -1,4 +1,4 @@
-package proxy
+﻿package proxy
 
 import (
 	"encoding/json"
@@ -465,8 +465,18 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// 获取账号
-	account := h.pool.GetNext()
+	// 解析模型�?thinking 模式
+	thinkingCfg := config.GetThinkingConfig()
+	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	req.Model = actualModel
+	estimatedInputTokens := estimateClaudeRequestInputTokens(&req)
+
+	// 转换请求（先生成 conversationID）
+	kiroPayload := ClaudeToKiro(&req, thinking)
+
+	// 使用会话粘滞获取账号
+	conversationID := kiroPayload.ConversationState.ConversationID
+	account := h.pool.GetForConversation(conversationID)
 	if account == nil {
 		h.sendClaudeError(w, 503, "api_error", "No available accounts")
 		return
@@ -477,15 +487,6 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		h.sendClaudeError(w, 503, "api_error", "Token refresh failed: "+err.Error())
 		return
 	}
-
-	// 解析模型�?thinking 模式
-	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
-	req.Model = actualModel
-	estimatedInputTokens := estimateClaudeRequestInputTokens(&req)
-
-	// 转换请求
-	kiroPayload := ClaudeToKiro(&req, thinking)
 
 	// 流式或非流式
 	if req.Stream {
@@ -1059,7 +1060,18 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	account := h.pool.GetNext()
+	// 解析模型�?thinking 模式
+	thinkingCfg := config.GetThinkingConfig()
+	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	req.Model = actualModel
+	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
+
+	// 转换请求（先生成 conversationID）
+	kiroPayload := OpenAIToKiro(&req, thinking)
+
+	// 使用会话粘滞获取账号
+	conversationID := kiroPayload.ConversationState.ConversationID
+	account := h.pool.GetForConversation(conversationID)
 	if account == nil {
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
@@ -1069,14 +1081,6 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		h.sendOpenAIError(w, 503, "server_error", "Token refresh failed")
 		return
 	}
-
-	// 解析模型�?thinking 模式
-	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
-	req.Model = actualModel
-	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
-
-	kiroPayload := OpenAIToKiro(&req, thinking)
 
 	if req.Stream {
 		h.handleOpenAIStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens)

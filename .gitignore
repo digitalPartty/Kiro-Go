@@ -1,0 +1,41 @@
+# Sensitive data
+data/
+*.json
+!version.json
+!go.sum
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Build artifacts
+kiro-api-proxy
+kiro-api-proxy.exe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Dependency directories
+vendor/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

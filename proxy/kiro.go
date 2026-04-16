@@ -148,14 +148,9 @@ type KiroStreamCallback struct {
 
 // getSortedEndpoints 根据首选端点配置排序端点列表
 func getSortedEndpoints(preferred string) []kiroEndpoint {
-	if preferred == "amazonq" {
-		return []kiroEndpoint{kiroEndpoints[1], kiroEndpoints[0]}
-	}
-	if preferred == "codewhisperer" {
-		return []kiroEndpoint{kiroEndpoints[0], kiroEndpoints[1]}
-	}
-	// "auto" 或空值：默认顺序
-	return []kiroEndpoint{kiroEndpoints[0], kiroEndpoints[1]}
+	// 只返回 CodeWhisperer 端点，不使用 AmazonQ
+	// 会在同一个端点上重试一次
+	return []kiroEndpoint{kiroEndpoints[0]}
 }
 
 // CallKiroAPI 调用 Kiro API（流式），429 后等待 3 秒重试一次，再失败则禁用 6 小时
@@ -180,25 +175,16 @@ func CallKiroAPIWithContext(ctx interface{}, account *config.Account, payload *K
 		amzUserAgent = fmt.Sprintf("aws-sdk-js/1.0.27 KiroIDE %s", KiroVersion)
 	}
 
-	// 根据配置排序端点
+	// 根据配置排序端点（现在只返回 CodeWhisperer）
 	endpoints := getSortedEndpoints(config.GetPreferredEndpoint())
 
 	var lastErr error
-	var got429 bool // 标记是否已经遇到过 429
+	maxRetries := 2 // 总共尝试 2 次（第一次 + 重试 1 次）
 	
-	for i, ep := range endpoints {
-		// 检查上下文是否已取消
-		if ctx != nil {
-			select {
-			case <-ctx.(interface{ Done() <-chan struct{} }).Done():
-				return fmt.Errorf("request cancelled by client")
-			default:
-			}
-		}
-
-		// 如果之前遇到过 429，等待 3 秒后重试
-		if got429 && i > 0 {
-			fmt.Printf("[KiroAPI] Got 429, waiting 3s before retry with %s...\n", ep.Name)
+	for retry := 0; retry < maxRetries; retry++ {
+		// 如果是重试，等待 3 秒
+		if retry > 0 {
+			fmt.Printf("[KiroAPI] Got 429, waiting 3s before retry (attempt %d/%d)...\n", retry+1, maxRetries)
 			select {
 			case <-time.After(3 * time.Second):
 				// 等待完成
@@ -211,7 +197,18 @@ func CallKiroAPIWithContext(ctx interface{}, account *config.Account, payload *K
 				return fmt.Errorf("request cancelled during retry wait")
 			}
 		}
+		
+		// 检查上下文是否已取消
+		if ctx != nil {
+			select {
+			case <-ctx.(interface{ Done() <-chan struct{} }).Done():
+				return fmt.Errorf("request cancelled by client")
+			default:
+			}
+		}
 
+		ep := endpoints[0] // 只使用第一个端点（CodeWhisperer）
+		
 		// 更新 payload 中的 origin
 		payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
 
@@ -253,15 +250,14 @@ func CallKiroAPIWithContext(ctx interface{}, account *config.Account, payload *K
 		if resp.StatusCode == 429 {
 			resp.Body.Close()
 			
-			if got429 {
-				// 第二次 429，返回错误（外层会禁用账号 6 小时）
-				fmt.Printf("[KiroAPI] Endpoint %s quota exhausted (429) again, will disable account\n", ep.Name)
-				lastErr = fmt.Errorf("rate_limit:quota exhausted on %s after retry", ep.Name)
-				return lastErr // 直接返回，触发禁用
+			if retry == maxRetries-1 {
+				// 最后一次重试也失败了，返回错误（外层会禁用账号 1 小时）
+				fmt.Printf("[KiroAPI] Endpoint %s quota exhausted (429) after %d attempts, will disable account for 1 hour\n", ep.Name, maxRetries)
+				lastErr = fmt.Errorf("rate_limit:quota exhausted on %s after %d retries", ep.Name, maxRetries)
+				return lastErr
 			} else {
-				// 第一次 429，标记并继续尝试下一个端点
+				// 还有重试机会
 				fmt.Printf("[KiroAPI] Endpoint %s quota exhausted (429), will retry after 3s\n", ep.Name)
-				got429 = true
 				lastErr = fmt.Errorf("rate_limit:quota exhausted on %s", ep.Name)
 				continue
 			}
